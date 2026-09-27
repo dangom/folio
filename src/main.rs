@@ -1,4 +1,4 @@
-//! md4less: render Markdown or Org as ANSI-styled text for `less -R`.
+//! folio: render Markdown or Org as ANSI-styled text for `less -R`.
 //!
 //! Zero dependencies and line-oriented: each input line is rendered on its
 //! own, prose word-wrapped to an 80-column measure, while code, tables and
@@ -8,21 +8,25 @@
 //! the text and an H1, H2… marker hanging in the left margin, booktabs tables,
 //! and colour kept for warnings and errors.
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Read, StdoutLock, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::{env, fs};
 
 const USAGE: &str = "\
-usage: md4less [--md | --org] [FILE | -]
+usage: folio [--md | --org] [FILE | -]
 
 Render Markdown or Org as ANSI text for `less -R`. Files with other extensions
 produce no output (exit 1), so less falls back to showing them as is:
 
-    export LESSOPEN='|md4less %s'
+    export LESSOPEN='|folio -- %s'
+
+Standard input is rendered when it reads as Markdown or Org (--md or --org to
+insist), and passed through unchanged otherwise.
 
 The palette follows the terminal background (COLORFGBG); set
-MD4LESS_LIGHT=day, night or plain to choose one.
+FOLIO_LIGHT=day, night or plain to choose one.
 ";
 
 /// Width of the left margin, where heading markers (H1, H2, ...) hang.
@@ -72,6 +76,26 @@ const TODO_WORDS: [&[u8]; 11] =
 const DONE_WORDS: [&[u8]; 4] = [b"DONE", b"KILL", b"CANCELLED", b"CANCELED"];
 const PLANNING: [&[u8]; 3] = [b"SCHEDULED:", b"DEADLINE:", b"CLOSED:"];
 
+/// Input past this size is left to less itself, which pages anything lazily.
+const MAX_INPUT: usize = 256 << 20;
+/// Inline nesting deeper than this is no document: the rest is shown as is.
+const MAX_DEPTH: usize = 16;
+/// Failed scans for a closing bracket or backtick run allowed per line, before
+/// those are taken literally; keeps pathological lines from going quadratic.
+const MAX_MISSES: usize = 32;
+/// The longest code span looked for, in bytes.
+const MAX_SPAN: usize = 4096;
+/// How much of piped input to read before guessing its format.
+const SNIFF: usize = 64 << 10;
+/// Words that open lines of code far more often than lines of prose.
+const CODE_WORDS: [&[u8]; 44] = [
+    b"import", b"from", b"def", b"class", b"return", b"fn", b"pub", b"use", b"let", b"const", b"var",
+    b"function", b"struct", b"impl", b"enum", b"package", b"func", b"if", b"elif", b"else", b"fi", b"then",
+    b"for", b"while", b"do", b"done", b"case", b"esac", b"export", b"local", b"echo", b"alias", b"source",
+    b"set", b"unset", b"print", b"printf", b"try", b"catch", b"end", b"#include", b"#define", b"#ifdef",
+    b"#endif",
+];
+
 static MD_SPECIAL: [bool; 256] = byte_set(b"\\`*_~![<&:");
 static ORG_SPECIAL: [bool; 256] = byte_set(b"*/_=~+[<:");
 
@@ -82,10 +106,10 @@ enum Format {
 }
 
 fn main() -> ExitCode {
-    let mut format = None;
-    let mut path = None;
+    let (mut format, mut path, mut options) = (None, None, true);
     for arg in env::args_os().skip(1) {
-        match arg.to_str() {
+        match arg.to_str().filter(|_| options) {
+            Some("--") => options = false, // what follows is a file name, even `--org`
             Some("--md" | "--markdown") => format = Some(Format::Md),
             Some("--org") => format = Some(Format::Org),
             Some("-h" | "--help") => {
@@ -102,6 +126,10 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             };
             format = Some(f);
+            // Only regular files of sane size: less pages devices, pipes and giants itself.
+            if !fs::metadata(&p).is_ok_and(|m| m.is_file() && m.len() <= MAX_INPUT as u64) {
+                return ExitCode::FAILURE;
+            }
             match fs::read(&p) {
                 Ok(s) => s,
                 Err(_) => return ExitCode::FAILURE,
@@ -112,13 +140,26 @@ fn main() -> ExitCode {
                 eprint!("{USAGE}");
                 return ExitCode::from(2);
             }
+            let mut stdin = io::stdin().lock();
             let mut s = Vec::new();
-            if io::stdin().read_to_end(&mut s).is_err() {
+            if stdin.by_ref().take(SNIFF as u64).read_to_end(&mut s).is_err() {
                 return ExitCode::FAILURE;
+            }
+            // Piped input has no name to go by: guess, and pass it through unless sure.
+            let Some(f) = format.or_else(|| sniff(&s)) else {
+                return pass(&s, &mut stdin);
+            };
+            format = Some(f);
+            if stdin.by_ref().take((MAX_INPUT + 1 - s.len()) as u64).read_to_end(&mut s).is_err() {
+                return ExitCode::FAILURE;
+            }
+            if s.len() > MAX_INPUT {
+                return pass(&s, &mut stdin);
             }
             s
         }
     };
+    let src = defang(src);
     let mut ink = Ink {
         out: Vec::with_capacity(1 << 17),
         stack: Vec::with_capacity(8),
@@ -129,6 +170,7 @@ fn main() -> ExitCode {
         line: 0,
         hang: None,
         widest: 0,
+        depth: 0,
         wrap: Wrap::default(),
     };
     match format.unwrap_or(Format::Md) {
@@ -139,6 +181,51 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Copy input through untouched, as cat would.
+fn pass(head: &[u8], rest: &mut impl Read) -> ExitCode {
+    let mut out = io::stdout().lock();
+    let _ = out.write_all(head).and_then(|()| io::copy(rest, &mut out));
+    ExitCode::SUCCESS
+}
+
+/// Make control characters visible, so a document can't drive the terminal:
+/// no escape sequences, no carriage return overprinting a line, no C1
+/// controls, and no bidi overrides displaying text other than as it reads.
+fn defang(src: Vec<u8>) -> Vec<u8> {
+    let (mut out, mut done, mut k) = (None::<Vec<u8>>, 0, 0);
+    while k < src.len() {
+        let b = src[k];
+        let len = match b {
+            b'\t' | b'\n' => 0,
+            b'\r' if src.get(k + 1) == Some(&b'\n') => 0,
+            0..=0x1f | 0x7f => 1,
+            0xC2 if matches!(src.get(k + 1), Some(0x80..=0x9f)) => 2,
+            0xE2 if matches!(src.get(k + 1..k + 3), Some([0x80, 0xAA..=0xAE] | [0x81, 0xA6..=0xA9])) => 3,
+            _ => 0,
+        };
+        if len == 0 {
+            k += 1;
+            continue;
+        }
+        let o = out.get_or_insert_with(|| Vec::with_capacity(src.len() + 64));
+        o.extend_from_slice(&src[done..k]);
+        if len == 1 {
+            o.extend_from_slice(&[b'^', b ^ 0x40]); // ESC shows as ^[, as in less
+        } else {
+            o.extend_from_slice("\u{FFFD}".as_bytes());
+        }
+        k += len;
+        done = k;
+    }
+    match out {
+        Some(mut o) => {
+            o.extend_from_slice(&src[done..]);
+            o
+        }
+        None => src,
+    }
+}
+
 fn detect(path: &Path) -> Option<Format> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "md" | "markdown" | "mdown" | "mkd" | "mkdn" | "mdx" => Some(Format::Md),
@@ -147,8 +234,160 @@ fn detect(path: &Path) -> Option<Format> {
     }
 }
 
+/// Guess from its opening lines whether piped input is Markdown or Org, by
+/// weighing their marks against those of code and config. Anything unclear is
+/// None, to be passed through as is: a false guess mangles, a missed one doesn't.
+fn sniff(head: &[u8]) -> Option<Format> {
+    let start = head.trim_ascii_start();
+    if head.starts_with(b"#!")
+        || head.contains(&0)
+        || [&b"<!doctype"[..], b"<html", b"<?xml"].iter().any(|p| starts_with_ic(start, p))
+    {
+        return None;
+    }
+    let (mut md, mut org, mut code) = (0, 0, 0);
+    // Inside a code fence or an Org block, only the delimiters count.
+    let (mut fenced, mut block, mut comment) = (false, false, false);
+    let (mut prev_blank, mut prev_text, mut prev_hash) = (true, false, false);
+    // Front matter is YAML or TOML, and says nothing about what follows.
+    let mut head = head;
+    for fence in [&b"---\n"[..], b"+++\n"] {
+        if let Some(rest) = head.strip_prefix(fence)
+            && let Some(end) = find(rest, &[b"\n", fence].concat())
+        {
+            head = &rest[end + fence.len() + 1..];
+        }
+    }
+    for line in head.split(|&b| b == b'\n').take(500) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let (ind, t) = indent(line);
+        let t = t.trim_ascii_end();
+        if t.is_empty() {
+            (prev_blank, prev_text, prev_hash) = (true, false, false);
+            continue;
+        }
+        if fence_open(t).is_some() {
+            fenced = !fenced;
+            md += 2;
+            continue;
+        }
+        if starts_with_ic(t, b"#+begin_") || starts_with_ic(t, b"#+end_") {
+            block = starts_with_ic(t, b"#+begin_");
+            org += 3;
+            continue;
+        }
+        if fenced || block {
+            continue;
+        }
+        if t.starts_with(b"diff --git") || t.starts_with(b"@@ -") {
+            return None;
+        }
+        // Minified code: long lines with next to no spaces.
+        if t.len() > 500 && t.iter().filter(|&&b| b == b' ').count() * 20 < t.len() {
+            code += 10;
+            continue;
+        }
+        // HTML turns up in both, and weighs for neither.
+        if t[0] == b'<' && t.ends_with(b">") {
+            continue;
+        }
+        // A C block comment, whose doc text may well be Markdown, or a run of
+        // `#` lines, which Markdown headings never form, is code.
+        let hash = t[0] == b'#' && !t.starts_with(b"#+");
+        if comment || t.starts_with(b"/*") || (hash && prev_hash) {
+            comment = (comment || t.starts_with(b"/*")) && find(t, b"*/").is_none();
+            code += 1;
+            (prev_blank, prev_text, prev_hash) = (false, true, hash);
+            continue;
+        }
+
+        // Org
+        let key = t.strip_prefix(b"#+").map(|k| k.iter().take_while(|b| b.is_ascii_alphabetic()).count());
+        if key.is_some_and(|n| n > 0 && t.get(n + 2) == Some(&b':')) {
+            org += 3;
+        } else if is_drawer(t) || t.eq_ignore_ascii_case(b":END:") {
+            org += 2;
+        }
+        if ind == 0 && line[0] == b'*' {
+            let stars = run(line, 0, b'*');
+            if line.get(stars) == Some(&b' ') {
+                org += stars.min(2); // a lone `* ` may be a Markdown bullet
+            }
+        }
+        if let Some(p) = find(t, b"[[")
+            && let Some(q) = find(&t[p..], b"]]")
+        {
+            let inner = &t[p + 2..p + q];
+            if p == 0 && p + q + 2 == t.len() && inner.iter().all(|&b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
+                code += 1; // a TOML array of tables
+            } else if inner.first().is_some_and(|&b| !is_ws(b)) && inner.last().is_some_and(|&b| !is_ws(b)) {
+                org += 2; // a link; shell tests read `[[ -f x ]]`
+            }
+        }
+
+        // Markdown; a `# heading` counts little, as it reads as a comment too.
+        if ind == 0
+            && prev_blank
+            && let Some((level, text)) = atx(t)
+            && !text.is_empty()
+        {
+            md += if level > 1 { 2 } else { 1 };
+        }
+        if prev_text && setext(line) == Some(1) {
+            md += 2;
+        }
+        if t.contains(&b'[') && find(t, b"](").is_some() {
+            md += 2;
+        }
+        if t.contains(&b'|') && table_delim(line).is_some() {
+            md += 2;
+        }
+        let item = list_marker(t, true).filter(|_| ind != 1); // ` * ` continues a C comment
+        let body = item.map_or(t, |m| t[m..].trim_ascii_start());
+        let word = &body[..body.iter().position(|&b| b == b' ' || b == b'(').unwrap_or(body.len())];
+        let keyed = word.len() > 1
+            && word.ends_with(b":")
+            && !word[0].is_ascii_uppercase() // prose says `Note:`, config `name:`
+            && word[..word.len() - 1].iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        // YAML lists hold words; Markdown ones, mostly prose.
+        let prose = body.split(|&b| b == b' ').filter(|w| !w.is_empty()).count() >= 3;
+        if (item.is_some() && !keyed && prose) || t.starts_with(b"> ") {
+            md += 1;
+        }
+        let bold = find(t, b"**").is_some_and(|p| {
+            let r = &t[p + 2..];
+            r.first().is_some_and(|&b| b != b'*' && !is_ws(b)) && find(r, b"**").is_some()
+        });
+        if bold || t.iter().filter(|&&b| b == b'`').count() >= 2 {
+            md += 1;
+        }
+
+        // Code and config
+        let assign = word.iter().position(|&b| b == b'=').is_some_and(|p| {
+            p > 0 && word[..p].iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        });
+        if keyed
+            || assign
+            || CODE_WORDS.contains(&word)
+            || t[0] == b'('
+            || matches!(t[t.len() - 1], b';' | b'{' | b'}' | b'\\')
+            || [&b"//"[..], b"/*", b"*/", b"$(", b"${", b"&&", b"||", b" = "].iter().any(|p| find(t, p).is_some())
+        {
+            code += 1;
+        }
+        (prev_blank, prev_text, prev_hash) = (false, true, hash);
+    }
+    if org >= 3 && org > md && org > 2 * code {
+        Some(Format::Org)
+    } else if md >= 4 && 2 * md > 3 * code {
+        Some(Format::Md)
+    } else {
+        None
+    }
+}
+
 fn palette() -> &'static Palette {
-    match env::var("MD4LESS_LIGHT").as_deref() {
+    match env::var("FOLIO_LIGHT").as_deref() {
         Ok("day") => return &DAY,
         Ok("night") => return &NIGHT,
         Ok("plain") => return &PLAIN,
@@ -203,6 +442,7 @@ struct Ink {
     line: usize,         // where the current line starts in `out`
     hang: Option<usize>, // where in `out` wrapped prose continues from, if it may wrap
     widest: usize,       // columns of the widest row the last line wrapped into, or 0
+    depth: usize,        // how deeply inline spans are nested
     wrap: Wrap,
 }
 
@@ -680,23 +920,27 @@ fn table(ink: &mut Ink, lead: &[u8], rows: &[Row], aligns: &[Align], inline: Inl
         rendered.push(Some(out));
     }
     let total = widths.iter().sum::<usize>() + GAP * widths.len().saturating_sub(1);
+    // Too wide to align, and padding every row out to it could bloat the output
+    // without bound: leave such a table ragged, each row as long as its cells.
+    let ragged = total > 4 * MEASURE;
     for row in &rendered {
         ink.raw(lead);
         match row {
             None => {
                 ink.push(ink.p.faded);
-                for _ in 0..total {
+                for _ in 0..if ragged { MEASURE } else { total } {
                     ink.raw("─");
                 }
                 ink.pop();
             }
             Some(cells) => {
-                for (c, &w) in widths.iter().enumerate() {
+                let cols = if ragged { cells.len() } else { widths.len() };
+                for c in 0..cols {
                     if c > 0 {
                         ink.pad(GAP);
                     }
                     let (text, tw) = cells.get(c).map_or((&b""[..], 0), |(t, w)| (t.as_slice(), *w));
-                    let gap = w - tw;
+                    let gap = widths.get(c).filter(|_| !ragged).map_or(0, |&w| w - tw);
                     let left = match aligns.get(c) {
                         Some(Align::Right) => gap,
                         Some(Align::Center) => gap / 2,
@@ -704,7 +948,7 @@ fn table(ink: &mut Ink, lead: &[u8], rows: &[Row], aligns: &[Align], inline: Inl
                     };
                     ink.pad(left);
                     ink.raw(text);
-                    if c + 1 < widths.len() {
+                    if c + 1 < cols {
                         ink.pad(gap - left);
                     }
                 }
@@ -969,7 +1213,12 @@ fn alert(t: &[u8]) -> Option<&[u8]> {
 }
 
 fn md_inline(ink: &mut Ink, s: &[u8]) {
-    let (mut i, mut lit) = (0, 0);
+    if ink.depth == MAX_DEPTH {
+        ink.raw(s);
+        return;
+    }
+    ink.depth += 1;
+    let (mut i, mut lit, mut misses) = (0, 0, 0);
     let mut dead = [false; 7]; // delimiter runs already known to have no closer
     while i < s.len() {
         let c = s[i];
@@ -989,7 +1238,9 @@ fn md_inline(ink: &mut Ink, s: &[u8]) {
         }
         ink.raw(&s[lit..i]);
         lit = i;
+        let costly = c == b'`' || c == b'[' || (c == b'!' && s.get(i + 1) == Some(&b'['));
         let end = match c {
+            _ if costly && misses == MAX_MISSES => None,
             b'\\' if s.get(i + 1).is_some_and(u8::is_ascii_punctuation) => {
                 ink.raw(&s[i + 1..i + 2]);
                 Some(i + 2)
@@ -1002,12 +1253,16 @@ fn md_inline(ink: &mut Ink, s: &[u8]) {
             b'&' => entity(ink, s, i),
             _ => None,
         };
+        if costly && end.is_none() {
+            misses = (misses + 1).min(MAX_MISSES);
+        }
         match end {
             Some(e) => (i, lit) = (e, e),
             None => i += if matches!(c, b'`' | b'*' | b'_' | b'~') { run(s, i, c) } else { 1 },
         }
     }
     ink.raw(&s[lit..]);
+    ink.depth -= 1;
 }
 
 fn code_span(ink: &mut Ink, s: &[u8], i: usize) -> Option<usize> {
@@ -1021,10 +1276,11 @@ fn code_span(ink: &mut Ink, s: &[u8], i: usize) -> Option<usize> {
     Some(j + n)
 }
 
-/// Start of the next run of exactly `n` copies of `c` at or after `from`.
+/// Start of the next run of exactly `n` copies of `c` at or after `from`,
+/// within `MAX_SPAN` bytes.
 fn find_run(s: &[u8], from: usize, c: u8, n: usize) -> Option<usize> {
     let mut j = from;
-    while j < s.len() {
+    while j < s.len().min(from + MAX_SPAN) {
         if s[j] == c {
             let k = run(s, j, c);
             if k == n {
@@ -1227,6 +1483,17 @@ enum Block {
 
 fn org(src: &[u8], ink: &mut Ink) {
     let lines = split_lines(src);
+    // Where blocks and drawers close, found in one pass: one never closed is plain text.
+    let mut block_ends = HashMap::new(); // the last `#+end_NAME` of each name
+    let mut drawer_end = None; // the last `:END:`
+    for (k, l) in lines.iter().enumerate() {
+        let t = l.trim_ascii();
+        if starts_with_ic(t, b"#+end_") {
+            block_ends.insert(t[6..].to_ascii_lowercase(), k);
+        } else if t.eq_ignore_ascii_case(b":END:") {
+            drawer_end = Some(k);
+        }
+    }
     let mut block: Option<(Block, &[u8])> = None; // open #+begin_ block: kind and name
     let mut drawer = false;
     let mut i = 0;
@@ -1280,8 +1547,7 @@ fn org(src: &[u8], ink: &mut Ink) {
         if starts_with_ic(t, b"#+begin_") {
             let spec = &t[8..];
             let name = &spec[..spec.iter().position(|&b| is_ws(b)).unwrap_or(spec.len())];
-            // An unterminated block is just a keyword line.
-            if lines[i..].iter().any(|l| block_end(indent(l).1, name)) {
+            if block_ends.get(&name.to_ascii_lowercase()).is_some_and(|&e| e >= i) {
                 let is = |k: &[u8]| name.eq_ignore_ascii_case(k);
                 let kind = if is(b"src") || is(b"example") {
                     Block::Code
@@ -1321,7 +1587,7 @@ fn org(src: &[u8], ink: &mut Ink) {
         } else if t == b":" || t.starts_with(b": ") {
             ink.raw(lead);
             ink.styled(ink.p.grey, t);
-        } else if is_drawer(t) && lines[i..].iter().any(|l| l.trim_ascii().eq_ignore_ascii_case(b":END:")) {
+        } else if is_drawer(t) && drawer_end.is_some_and(|e| e >= i) {
             ink.styled(ink.p.faded, line);
             drawer = true;
         } else if PLANNING.iter().any(|k| t.starts_with(k)) {
@@ -1429,20 +1695,17 @@ fn org_table(ink: &mut Ink, lead: &[u8], lines: &[&[u8]]) {
     // (the rows above the first rule).
     let head = rows.iter().position(|r| matches!(r, Row::Rule)).filter(|&p| p + 1 < rows.len()).unwrap_or(0);
     let ncols = rows.iter().map(|r| if let Row::Cells(c) = r { c.len() } else { 0 }).max().unwrap_or(0);
-    let aligns: Vec<Align> = (0..ncols)
-        .map(|c| {
-            let (mut total, mut numeric) = (0, 0);
-            for row in &rows[head..] {
-                if let Row::Cells(cells) = row
-                    && let Some(v) = cells.get(c).filter(|v| !v.is_empty())
-                {
-                    total += 1;
-                    numeric += is_number(v) as usize;
-                }
+    let mut counts = vec![(0, 0); ncols]; // filled and numeric cells per column
+    for row in &rows[head..] {
+        if let Row::Cells(cells) = row {
+            for (c, v) in cells.iter().enumerate().filter(|(_, v)| !v.is_empty()) {
+                counts[c].0 += 1;
+                counts[c].1 += is_number(v) as usize;
             }
-            if numeric * 2 > total { Align::Right } else { Align::Left }
-        })
-        .collect();
+        }
+    }
+    let aligns: Vec<Align> =
+        counts.iter().map(|&(filled, numeric)| if numeric * 2 > filled { Align::Right } else { Align::Left }).collect();
     table(ink, lead, &rows, &aligns, org_inline);
 }
 
@@ -1452,7 +1715,12 @@ fn is_number(v: &[u8]) -> bool {
 }
 
 fn org_inline(ink: &mut Ink, s: &[u8]) {
-    let (mut i, mut lit) = (0, 0);
+    if ink.depth == MAX_DEPTH {
+        ink.raw(s);
+        return;
+    }
+    ink.depth += 1;
+    let (mut i, mut lit, mut misses) = (0, 0, 0);
     let mut dead = [false; 6]; // markers already known to have no closer
     while i < s.len() {
         let c = s[i];
@@ -1472,17 +1740,23 @@ fn org_inline(ink: &mut Ink, s: &[u8]) {
         }
         ink.raw(&s[lit..i]);
         lit = i;
+        let costly = c == b'[' || c == b'<';
         let end = match c {
+            _ if costly && misses == MAX_MISSES => None,
             b'[' => org_bracket(ink, s, i),
             b'<' => org_angle(ink, s, i),
             _ => org_emphasis(ink, s, i, &mut dead),
         };
+        if costly && end.is_none() {
+            misses = (misses + 1).min(MAX_MISSES);
+        }
         match end {
             Some(e) => (i, lit) = (e, e),
             None => i += 1,
         }
     }
     ink.raw(&s[lit..]);
+    ink.depth -= 1;
 }
 
 /// `*bold*`, `/italic/`, `_underline_`, `+strike+`, `=verbatim=` or `~code~` at `i`.

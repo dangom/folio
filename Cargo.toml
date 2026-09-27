@@ -1,8 +1,12 @@
 [package]
-name = "md4less"
+name = "folio-pager"
 version = "0.1.0"
 edition = "2024"
 description = "Render Markdown and Org files as ANSI text for less"
+
+[[bin]]
+name = "folio"
+path = "src/main.rs"
 
 [dependencies]
 
