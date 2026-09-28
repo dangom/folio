@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy && rustup default stable
+
+      - name: Lint
+        run: cargo clippy --release -- -D warnings
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Smoke test
+        run: |
+          folio=target/release/folio
+          # Markdown and Org files are rendered.
+          $folio README.md | grep -q 'H1'
+          printf '* Heading\n' > "$RUNNER_TEMP/t.org"
+          $folio "$RUNNER_TEMP/t.org" | grep -q 'H1'
+          # Other files are declined, so less shows them as is.
+          if $folio Cargo.toml; then exit 1; fi
+          # Piped code passes through byte for byte.
+          script=$'#!/bin/sh\n# comment\necho "*hi*"\n'
+          cmp <(printf '%s' "$script" | $folio) <(printf '%s' "$script")
+          # A document's escape sequences never reach the terminal.
+          printf '# T\n\033]0;title\007 \033[2J\n' > "$RUNNER_TEMP/e.md"
+          if $folio "$RUNNER_TEMP/e.md" | grep -qF -e $'\033]' -e $'\033[2J'; then exit 1; fi
