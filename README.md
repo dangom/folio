@@ -4,8 +4,6 @@ A simple Markdown and Org file parser designed to be used for quick pagination  
 
 It's designed to be fast. On a Macbook air it reaches  ~250 MB/s so this README.md for example would render in less than 1ms.
 
-![folio rendering this README in the terminal](folio.png)
-
 ## Installation
 
 ```sh
@@ -34,6 +32,8 @@ cat script.sh | folio   # unchanged
 ## Aesthetics
 
 Meant to look like ink on paper.
+
+![folio rendering this README in the terminal](folio.png)
 
 - greys only, with weight carrying the hierarchy; colour is kept for warnings
 - headings flush with the text, their level (`H1`, `H2`, …) in the margin
