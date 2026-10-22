@@ -96,8 +96,8 @@ const CODE_WORDS: [&[u8]; 44] = [
     b"#endif",
 ];
 
-static MD_SPECIAL: [bool; 256] = byte_set(b"\\`*_~![<&:");
-static ORG_SPECIAL: [bool; 256] = byte_set(b"*/_=~+[<:");
+static MD_SPECIAL: [bool; 256] = byte_set(b"\\`*_~![<&:$");
+static ORG_SPECIAL: [bool; 256] = byte_set(b"*/_=~+[<:$\\");
 
 #[derive(Clone, Copy)]
 enum Format {
@@ -1039,6 +1039,22 @@ fn markdown(src: &[u8], ink: &mut Ink) {
             continue;
         }
 
+        if let Some((c, n, info)) = fence_open(t)
+            && info == b"math"
+            && let Some(e) = lines[i..].iter().take(MAX_MATH_LINES).position(|l| {
+                fence_open(indent(l).1).is_some_and(|(c2, n2, info)| c2 == c && n2 >= n && info.is_empty())
+            })
+        {
+            display(ink, lead, &lines[i..i + e].join(&b' '));
+            i += e + 1;
+            continue;
+        }
+        if MATH_OPENS.iter().any(|o| t.starts_with(o))
+            && let Some(next) = math_block(ink, lead, &lines, i - 1)
+        {
+            i = next;
+            continue;
+        }
         if let Some((c, n, _)) = fence_open(t) {
             fence = Some((c, n));
             ink.raw(lead);
@@ -1112,6 +1128,7 @@ fn md_continues(prev: &[u8], line: &[u8], next: Option<&[u8]>) -> bool {
         || atx(t).is_some()
         || is_hr(t)
         || t.starts_with(b"<!--")
+        || MATH_OPENS.iter().any(|o| t.starts_with(o))
         || t[0] == b'>'
         || list_marker(t, true).is_some()
         || next.is_some_and(|l| setext(l).is_some() || table_delim(l).is_some()))
@@ -1284,7 +1301,7 @@ fn md_inline(ink: &mut Ink, s: &[u8]) {
         }
         ink.raw(&s[lit..i]);
         lit = i;
-        let costly = c == b'`' || c == b'[' || (c == b'!' && s.get(i + 1) == Some(&b'['));
+        let costly = c == b'`' || c == b'[' || c == b'$' || (c == b'!' && s.get(i + 1) == Some(&b'['));
         let end = match c {
             _ if costly && misses == MAX_MISSES => None,
             b'\\' if s.get(i + 1).is_some_and(u8::is_ascii_punctuation) => {
@@ -1297,6 +1314,7 @@ fn md_inline(ink: &mut Ink, s: &[u8]) {
             b'[' => md_link(ink, s, i, false),
             b'<' => angle(ink, s, i),
             b'&' => entity(ink, s, i),
+            b'$' => math_inline(ink, s, i),
             _ => None,
         };
         if costly && end.is_none() {
@@ -1614,6 +1632,12 @@ fn org(src: &[u8], ink: &mut Ink) {
             }
         }
 
+        if MATH_OPENS.iter().any(|o| t.starts_with(o))
+            && let Some(next) = math_block(ink, lead, &lines, i - 1)
+        {
+            i = next;
+            continue;
+        }
         if t.starts_with(b"#+") {
             // The #+ prefix hidden, and the title shown unlabelled.
             if starts_with_ic(t, b"#+title:") {
@@ -1677,6 +1701,7 @@ fn org_continues(lines: &[&[u8]], k: usize) -> bool {
         || t[0] == b'#'
         || t[0] == b':'
         || t[0] == b'|'
+        || MATH_OPENS.iter().any(|o| t.starts_with(o))
         || PLANNING.iter().any(|p| t.starts_with(p))
         || (t.len() >= 5 && t.iter().all(|&b| b == b'-'))
         || list_marker(t, ind > 0).is_some())
@@ -1805,11 +1830,12 @@ fn org_inline(ink: &mut Ink, s: &[u8]) {
         }
         ink.raw(&s[lit..i]);
         lit = i;
-        let costly = c == b'[' || c == b'<';
+        let costly = matches!(c, b'[' | b'<' | b'$' | b'\\');
         let end = match c {
             _ if costly && misses == MAX_MISSES => None,
             b'[' => org_bracket(ink, s, i),
             b'<' => org_angle(ink, s, i),
+            b'$' | b'\\' => math_inline(ink, s, i),
             _ => org_emphasis(ink, s, i, &mut dead),
         };
         if costly && end.is_none() {
@@ -1915,4 +1941,507 @@ fn is_date(t: &[u8]) -> bool {
         && t[5..7].iter().all(u8::is_ascii_digit)
         && t[7] == b'-'
         && t[8..10].iter().all(u8::is_ascii_digit)
+}
+
+// ---------------------------------------------------------------- math
+
+/// The lines to look through for the end of display math before taking its
+/// opening as text.
+const MAX_MATH_LINES: usize = 256;
+/// What opens a line of display math.
+const MATH_OPENS: [&[u8]; 3] = [b"$$", b"\\[", b"\\begin{"];
+
+/// Inline math at `i`: `$…$`, `$$…$$`, `\(…\)` or `\[…\]`.
+fn math_inline(ink: &mut Ink, s: &[u8], i: usize) -> Option<usize> {
+    let rest = &s[i..];
+    let close: &[u8] = if rest.starts_with(b"$$") {
+        b"$$"
+    } else if rest.starts_with(b"\\(") {
+        b"\\)"
+    } else if rest.starts_with(b"\\[") {
+        b"\\]"
+    } else if rest.starts_with(b"$") {
+        b"$"
+    } else {
+        return None;
+    };
+    let from = i + if close == b"$" { 1 } else { 2 };
+    // A lone `$` opens before and closes after a non-space, and not before a
+    // digit, so prices stay prices.
+    let single = close == b"$";
+    if single && s.get(from).is_none_or(|&b| is_ws(b)) {
+        return None;
+    }
+    let mut j = from;
+    loop {
+        j += find(&s[j..s.len().min(from + MAX_SPAN)], close)?;
+        if s[j - 1] != b'\\' {
+            break;
+        }
+        j += 1;
+    }
+    if j == from || (single && (is_ws(s[j - 1]) || s.get(j + 1).is_some_and(u8::is_ascii_digit))) {
+        return None;
+    }
+    ink.raw(tex(&s[from..j]).out);
+    Some(j + close.len())
+}
+
+/// Display math opening `lines[k]` (`$$`, `\[` or `\begin{…}`): rendered up
+/// to the line it closes on, returning the line after; None if it never closes.
+fn math_block(ink: &mut Ink, lead: &[u8], lines: &[&[u8]], k: usize) -> Option<usize> {
+    let t = lines[k].trim_ascii();
+    let (open, close) = if t.starts_with(b"$$") {
+        (b"$$".to_vec(), b"$$".to_vec())
+    } else if t.starts_with(b"\\[") {
+        (b"\\[".to_vec(), b"\\]".to_vec())
+    } else if t.starts_with(b"\\begin{") {
+        let env = &t[..=t.iter().position(|&b| b == b'}')?];
+        (env.to_vec(), [b"\\end", &env[6..]].concat())
+    } else {
+        return None;
+    };
+    let first = &t[open.len()..];
+    let end = if find(first, &close).is_some() {
+        first.ends_with(&close).then_some(k)? // `$$x$$ and more` is a paragraph
+    } else {
+        k + 1 + lines[k + 1..].iter().take(MAX_MATH_LINES).position(|l| l.trim_ascii().ends_with(&close))?
+    };
+    let body: Vec<u8> = lines[k..=end].iter().map(|l| l.trim_ascii()).collect::<Vec<_>>().join(&b' ');
+    display(ink, lead, &body[open.len()..body.len() - close.len()]);
+    Some(end + 1)
+}
+
+/// Display math: each row centred on the measure, or, when rows have an `&`,
+/// lined up at it and centred together.
+fn display(ink: &mut Ink, lead: &[u8], body: &[u8]) {
+    let mut rows = Vec::new();
+    let mut rest = body;
+    loop {
+        let (row, more) = match find(rest, b"\\\\") {
+            Some(p) => (&rest[..p], Some(&rest[p + 2..])),
+            None => (rest, None),
+        };
+        let t = tex(row);
+        if !t.out.trim_ascii().is_empty() {
+            let (l, r) = t.out.split_at(t.amp.unwrap_or(0));
+            rows.push((l.to_string(), r.to_string()));
+        }
+        match more {
+            Some(m) => rest = m,
+            None => break,
+        }
+    }
+    let avail = ink.width.saturating_sub(MARGIN + display_width(lead));
+    let widths: Vec<(usize, usize)> =
+        rows.iter().map(|(l, r)| (display_width(l.as_bytes()), display_width(r.as_bytes()))).collect();
+    let lw = widths.iter().map(|w| w.0).max().unwrap_or(0);
+    let block = widths.iter().map(|w| lw + w.1).max().unwrap_or(0);
+    for ((l, r), (wl, wr)) in rows.iter().zip(widths) {
+        ink.raw(lead);
+        ink.pad(if lw > 0 { avail.saturating_sub(block) / 2 + lw - wl } else { avail.saturating_sub(wr) / 2 });
+        ink.raw(l);
+        ink.raw(r);
+        ink.nl();
+    }
+}
+
+/// TeX's classes of math atom, as far as they decide the spacing between them.
+#[derive(Clone, Copy, PartialEq)]
+enum Atom {
+    Start,
+    Ord,
+    Op,
+    Bin,
+    Rel,
+    Open,
+    Close,
+    Punct,
+    Inner, // a fraction
+}
+
+/// TeX math set on one line in Unicode: letters in math italic, commands as
+/// their symbols, scripts raised or lowered where Unicode has the characters,
+/// and TeX's spacing around operators and relations.
+struct Tex {
+    out: String,
+    last: Atom,
+    script: bool,       // in a sub- or superscript: set tight
+    upright: bool,      // letters as typed rather than in math italic
+    depth: usize,       // how deeply arguments are nested
+    amp: Option<usize>, // where in `out` the first `&` falls
+}
+
+fn tex(s: &[u8]) -> Tex {
+    let mut t = Tex { out: String::new(), last: Atom::Start, script: false, upright: false, depth: 0, amp: None };
+    t.run(&String::from_utf8_lossy(s));
+    t
+}
+
+impl Tex {
+    /// `s` set on its own, inheriting script style and uprightness.
+    fn sub(&self, s: &str, script: bool, upright: bool) -> String {
+        if self.depth == MAX_DEPTH {
+            return s.to_string();
+        }
+        let mut t = Tex {
+            out: String::new(),
+            last: Atom::Start,
+            script: self.script || script,
+            upright: self.upright || upright,
+            depth: self.depth + 1,
+            amp: None,
+        };
+        t.run(s);
+        t.out
+    }
+
+    fn put(&mut self, text: &str, atom: Atom) {
+        use Atom::*;
+        let atom = if atom == Bin && !matches!(self.last, Ord | Close | Inner) { Ord } else { atom }; // unary minus
+        let space = match (self.last, atom) {
+            (Start, _) => false,
+            (Rel, a) => !matches!(a, Rel | Close | Punct),
+            (_, Rel) => self.last != Open,
+            (Bin, _) | (_, Bin) | (Punct, _) | (Op | Inner, Op | Inner) => true,
+            (Op | Inner, Ord) => text != ".",
+            (Ord | Close, Op | Inner) => !self.out.ends_with(['−', '+', '±', '/']), // after a sign, tight
+            _ => false,
+        };
+        if space && !self.script && !self.out.ends_with(' ') {
+            self.out.push(' ');
+        }
+        self.out.push_str(text);
+        self.last = atom;
+    }
+
+    fn put_char(&mut self, c: char) {
+        self.put(c.encode_utf8(&mut [0; 4]), atom(c));
+    }
+
+    fn space(&mut self, n: usize) {
+        for _ in 0..n {
+            self.out.push(' ');
+        }
+    }
+
+    fn run(&mut self, s: &str) {
+        let mut i = 0;
+        while let Some(c) = s[i..].chars().next() {
+            i += c.len_utf8();
+            match c {
+                ' ' | '\t' | '\n' | '{' | '}' => {}
+                '&' => {
+                    if self.depth == 0 && self.amp.is_none() {
+                        self.amp = Some(self.out.len());
+                        self.last = Atom::Ord; // as amsmath does, so `&=` is spaced as a relation
+                    }
+                }
+                '~' => self.space(1),
+                '^' | '_' => {
+                    let a = arg(s, &mut i);
+                    self.script(a, c == '^');
+                }
+                '\'' => self.put("′", Atom::Ord),
+                '-' => self.put("−", Atom::Bin),
+                '*' => self.put("∗", Atom::Bin),
+                'a'..='z' | 'A'..='Z' if !self.upright => self.put_char(italic(c)),
+                '\\' => self.command(s, &mut i),
+                _ => self.put_char(c),
+            }
+        }
+    }
+
+    /// A sub- or superscript: raised or lowered if Unicode can, else `^(…)`.
+    fn script(&mut self, a: &str, up: bool) {
+        let plain = self.sub(a, true, true);
+        let (from, to) = if up { SUP } else { SUB };
+        let moved: Option<String> =
+            plain.chars().map(|c| from.chars().position(|f| f == c).and_then(|k| to.chars().nth(k))).collect();
+        match moved {
+            Some(m) => self.out.push_str(&m),
+            None => {
+                let body = self.sub(a, true, false);
+                self.out.push(if up { '^' } else { '_' });
+                self.out.push_str(&if body.chars().count() > 1 { format!("({body})") } else { body });
+            }
+        }
+    }
+
+    fn command(&mut self, s: &str, i: &mut usize) {
+        let n = s[*i..].bytes().take_while(u8::is_ascii_alphabetic).count();
+        if n == 0 {
+            let Some(c) = s[*i..].chars().next() else { return self.put("\\", Atom::Ord) };
+            *i += c.len_utf8();
+            match c {
+                ',' | ':' | ';' | '>' | ' ' | '\\' => self.space(1),
+                '!' => {}
+                '|' => self.put("‖", Atom::Ord),
+                '{' => self.put("{", Atom::Open),
+                '}' => self.put("}", Atom::Close),
+                _ => self.put_char(c),
+            }
+            return;
+        }
+        let name = &s[*i..*i + n];
+        *i += n;
+        match name {
+            "frac" | "dfrac" | "tfrac" | "cfrac" => {
+                let (a, b) = (arg(s, i), arg(s, i));
+                let (a, b) = (self.sub(a, false, false), self.sub(b, false, false));
+                let f = match (a.as_str(), b.as_str()) {
+                    ("1", "2") => "½".to_string(),
+                    ("1", "3") => "⅓".to_string(),
+                    ("2", "3") => "⅔".to_string(),
+                    ("1", "4") => "¼".to_string(),
+                    ("3", "4") => "¾".to_string(),
+                    _ => format!("{}/{}", wrap(a), wrap(b)),
+                };
+                self.put(&f, Atom::Inner);
+            }
+            "sqrt" => {
+                let mut root = "√";
+                if s[*i..].starts_with('[')
+                    && let Some(e) = s[*i..].find(']')
+                {
+                    let index = &s[*i + 1..*i + e];
+                    *i += e + 1;
+                    match index.trim() {
+                        "3" => root = "∛",
+                        "4" => root = "∜",
+                        _ => self.script(index, true),
+                    }
+                }
+                let a = self.sub(arg(s, i), false, false);
+                self.put(&format!("{root}{}", wrap(a)), Atom::Ord);
+            }
+            "text" | "textrm" | "textit" | "textbf" | "textsf" | "texttt" | "textnormal" | "mbox" => {
+                let a = arg(s, i);
+                self.put(a, Atom::Ord);
+            }
+            "mathrm" | "mathbf" | "mathsf" | "mathtt" | "mathcal" | "mathscr" | "mathfrak" | "operatorname" => {
+                let a = self.sub(arg(s, i), false, true);
+                self.put(&a, if name == "operatorname" { Atom::Op } else { Atom::Ord });
+            }
+            "mathbb" => {
+                let a: String = arg(s, i).chars().filter(|c| !c.is_whitespace()).map(double_struck).collect();
+                self.put(&a, Atom::Ord);
+            }
+            "hat" | "widehat" | "bar" | "overline" | "underline" | "tilde" | "widetilde" | "vec" | "dot" | "ddot"
+            | "check" | "breve" | "acute" | "grave" => {
+                let mark = match name {
+                    "hat" | "widehat" => '\u{302}',
+                    "bar" => '\u{304}',
+                    "overline" => '\u{305}',
+                    "underline" => '\u{332}',
+                    "tilde" | "widetilde" => '\u{303}',
+                    "vec" => '\u{20D7}',
+                    "dot" => '\u{307}',
+                    "ddot" => '\u{308}',
+                    "check" => '\u{30C}',
+                    "breve" => '\u{306}',
+                    "acute" => '\u{301}',
+                    _ => '\u{300}',
+                };
+                // Lines run over every character; other accents sit over the middle one.
+                let a = self.sub(arg(s, i), false, false);
+                let line = matches!(name, "overline" | "underline");
+                let mid = a.chars().count() / 2;
+                let mut m = String::new();
+                for (k, c) in a.chars().enumerate() {
+                    m.push(c);
+                    if line || k == mid {
+                        m.push(mark);
+                    }
+                }
+                self.put(&m, Atom::Ord);
+            }
+            "overset" | "stackrel" | "underset" => {
+                let (top, base) = (arg(s, i), arg(s, i));
+                let b = self.sub(base, false, false);
+                let mut cs = b.chars();
+                let atom = match (cs.next(), cs.next()) {
+                    (Some(c), None) => atom(c),
+                    _ => Atom::Ord,
+                };
+                self.put(&b, atom);
+                self.script(top, name != "underset");
+            }
+            "left" | "right" | "middle" => {
+                if s[*i..].starts_with('.') {
+                    *i += 1;
+                }
+            }
+            "begin" | "end" | "label" | "tag" => {
+                arg(s, i);
+            }
+            "quad" => self.space(2),
+            "qquad" => self.space(4),
+            "bmod" => self.put("mod", Atom::Bin),
+            _ if FUNCTIONS.contains(&name) => self.put(name, Atom::Op),
+            _ if name.starts_with("big") || name.starts_with("Big") => {}
+            "displaystyle" | "textstyle" | "limits" | "nolimits" | "boxed" | "boldsymbol" | "bm" | "mathit"
+            | "nonumber" | "notag" => {}
+            _ => match symbol(name) {
+                Some(sym) => self.put_char(sym),
+                None => self.put(&format!("\\{name}"), Atom::Ord),
+            },
+        }
+    }
+}
+
+/// Parenthesised if an operator, relation or space stands outside brackets.
+fn wrap(s: String) -> String {
+    let mut depth = 0usize;
+    for c in s.chars() {
+        if "([{⟨⌊⌈".contains(c) {
+            depth += 1;
+        } else if ")]}⟩⌋⌉".contains(c) {
+            depth = depth.saturating_sub(1);
+        } else if depth == 0 && (c == ' ' || c == '/' || matches!(atom(c), Atom::Bin | Atom::Rel | Atom::Punct)) {
+            return format!("({s})");
+        }
+    }
+    s
+}
+
+/// The argument starting at `*i`: a braced group, a command, or one character.
+fn arg<'a>(s: &'a str, i: &mut usize) -> &'a str {
+    let b = s.as_bytes();
+    while b.get(*i) == Some(&b' ') {
+        *i += 1;
+    }
+    let start = *i;
+    match b.get(start) {
+        None => "",
+        Some(b'{') => {
+            let (mut depth, mut k) = (0, start);
+            while k < b.len() {
+                match b[k] {
+                    b'\\' => k += 1,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            *i = k + 1;
+                            return &s[start + 1..k];
+                        }
+                    }
+                    _ => {}
+                }
+                k += 1;
+            }
+            *i = b.len();
+            &s[start + 1..]
+        }
+        Some(b'\\') => {
+            let n = b[start + 1..].iter().take_while(|c| c.is_ascii_alphabetic()).count();
+            *i = start + 1 + if n > 0 { n } else { s[start + 1..].chars().next().map_or(0, char::len_utf8) };
+            &s[start..*i]
+        }
+        Some(_) => {
+            *i += s[start..].chars().next().map_or(1, char::len_utf8);
+            &s[start..*i]
+        }
+    }
+}
+
+fn atom(c: char) -> Atom {
+    match c {
+        '=' | '<' | '>' | ':' | '≤' | '≥' | '≠' | '≈' | '≡' | '∼' | '≃' | '≅' | '∝' | '∈' | '∉' | '∋' | '⊂' | '⊃'
+        | '⊆' | '⊇' | '→' | '←' | '↔' | '⇒' | '⇐' | '⇔' | '↦' | '⟶' | '↑' | '↓' | '∣' | '≪' | '≫' | '⊥' | '∥'
+        | '≔' | '⊢' | '⊨' | '≺' | '≻' | '≍' | '≐' => Atom::Rel,
+        '+' | '−' | '±' | '∓' | '×' | '÷' | '⋅' | '∗' | '⋆' | '∘' | '∙' | '∩' | '∪' | '∧' | '∨' | '⊕' | '⊗' | '∖'
+        | '⊙' => Atom::Bin,
+        '∑' | '∏' | '∐' | '∫' | '∬' | '∭' | '∮' | '⋃' | '⋂' | '⨁' | '⨂' => Atom::Op,
+        '(' | '[' | '{' | '⟨' | '⌊' | '⌈' => Atom::Open,
+        ')' | ']' | '}' | '⟩' | '⌋' | '⌉' | '!' => Atom::Close,
+        ',' | ';' => Atom::Punct,
+        _ => Atom::Ord,
+    }
+}
+
+fn italic(c: char) -> char {
+    match c {
+        'h' => 'ℎ', // the one hole in the block
+        'a'..='z' => char::from_u32(0x1D44E + (c as u32 - 'a' as u32)).unwrap_or(c),
+        _ => char::from_u32(0x1D434 + (c as u32 - 'A' as u32)).unwrap_or(c),
+    }
+}
+
+fn double_struck(c: char) -> char {
+    let at = |base: u32, first: char| char::from_u32(base + (c as u32 - first as u32)).unwrap_or(c);
+    match c {
+        'C' => 'ℂ',
+        'H' => 'ℍ',
+        'N' => 'ℕ',
+        'P' => 'ℙ',
+        'Q' => 'ℚ',
+        'R' => 'ℝ',
+        'Z' => 'ℤ',
+        'A'..='Z' => at(0x1D538, 'A'),
+        'a'..='z' => at(0x1D552, 'a'),
+        '0'..='9' => at(0x1D7D8, '0'),
+        _ => c,
+    }
+}
+
+/// What Unicode can raise and lower: characters, and their script forms at
+/// the same positions.
+const SUP: (&str, &str) = (
+    "0123456789+−=()abcdefghijklmnoprstuvwxyzABDEGHIJKLMNOPRTUVWαβγδεϵθιφϕχ′∗⊤∘",
+    "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻᴬᴮᴰᴱᴳᴴᴵᴶᴷᴸᴹᴺᴼᴾᴿᵀᵁⱽᵂᵅᵝᵞᵟᵋᵋᶿᶥᵠᵠᵡ′*ᵀ°",
+);
+const SUB: (&str, &str) =
+    ("0123456789+−=()aehijklmnoprstuvxβγρφϕχ,", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓᵦᵧᵨᵩᵩᵪ,");
+
+const FUNCTIONS: [&str; 30] = [
+    "sin", "cos", "tan", "cot", "sec", "csc", "arcsin", "arccos", "arctan", "sinh", "cosh", "tanh", "coth", "log",
+    "ln", "lg", "exp", "lim", "liminf", "limsup", "max", "min", "sup", "inf", "arg", "det", "dim", "gcd", "ker", "Pr",
+];
+
+/// TeX's symbol commands and their characters, in name–character pairs.
+const SYMBOLS: &str = "\
+    alpha α beta β gamma γ delta δ epsilon ϵ varepsilon ε zeta ζ eta η theta θ vartheta ϑ iota ι kappa κ \
+    lambda λ mu μ nu ν xi ξ pi π varpi ϖ rho ρ varrho ϱ sigma σ varsigma ς tau τ upsilon υ phi ϕ \
+    varphi φ chi χ psi ψ omega ω Gamma Γ Delta Δ Theta Θ Lambda Λ Xi Ξ Pi Π Sigma Σ Upsilon Υ Phi Φ \
+    Psi Ψ Omega Ω le ≤ leq ≤ ge ≥ geq ≥ ne ≠ neq ≠ approx ≈ equiv ≡ sim ∼ simeq ≃ cong ≅ propto ∝ in ∈ \
+    notin ∉ ni ∋ subset ⊂ supset ⊃ subseteq ⊆ supseteq ⊇ to → rightarrow → gets ← leftarrow ← \
+    leftrightarrow ↔ Rightarrow ⇒ implies ⇒ Leftarrow ⇐ Leftrightarrow ⇔ iff ⇔ mapsto ↦ longrightarrow ⟶ \
+    uparrow ↑ downarrow ↓ mid ∣ ll ≪ gg ≫ perp ⊥ parallel ∥ coloneqq ≔ vdash ⊢ models ⊨ prec ≺ succ ≻ \
+    asymp ≍ doteq ≐ pm ± mp ∓ times × div ÷ cdot ⋅ ast ∗ star ⋆ circ ∘ bullet ∙ cap ∩ cup ∪ wedge ∧ \
+    land ∧ vee ∨ lor ∨ oplus ⊕ otimes ⊗ setminus ∖ odot ⊙ sum ∑ prod ∏ coprod ∐ int ∫ iint ∬ iiint ∭ \
+    oint ∮ bigcup ⋃ bigcap ⋂ bigoplus ⨁ bigotimes ⨂ infty ∞ partial ∂ nabla ∇ forall ∀ exists ∃ \
+    nexists ∄ emptyset ∅ varnothing ∅ neg ¬ lnot ¬ top ⊤ bot ⊥ ell ℓ hbar ℏ Re ℜ Im ℑ aleph ℵ prime ′ \
+    angle ∠ triangle △ dots … ldots … dotsc … dotsb … cdots ⋯ vdots ⋮ ddots ⋱ langle ⟨ rangle ⟩ lfloor ⌊ \
+    rfloor ⌋ lceil ⌈ rceil ⌉ lbrace { rbrace } vert | lvert | rvert | Vert ‖ lVert ‖ rVert ‖ backslash \\";
+
+fn symbol(name: &str) -> Option<char> {
+    let mut words = SYMBOLS.split_ascii_whitespace();
+    while let (Some(n), Some(c)) = (words.next(), words.next()) {
+        if n == name {
+            return c.chars().next();
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn math() {
+        assert_eq!(SUP.0.chars().count(), SUP.1.chars().count());
+        assert_eq!(SUB.0.chars().count(), SUB.1.chars().count());
+        let t = |s: &str| tex(s.as_bytes()).out;
+        assert_eq!(t(r"x^2+\alpha_i"), "𝑥² + αᵢ");
+        assert_eq!(t(r"a=-b"), "𝑎 = −𝑏");
+        assert_eq!(t(r"\frac{1}{2}\sin x"), "½ sin 𝑥");
+        assert_eq!(t(r"\frac{a+b}{\sqrt{n}}"), "(𝑎 + 𝑏)/√𝑛");
+        assert_eq!(t(r"\mathrm{AUC}^*"), "AUC*");
+        assert_eq!(t(r"P_T"), "𝑃_𝑇");
+        assert_eq!(t(r"e^{i\pi}"), "𝑒^(𝑖π)");
+        assert_eq!(t(r"\frac{1-\pi}{\pi}\frac{r(s)}{1-r(s)}"), "(1 − π)/π 𝑟(𝑠)/(1 − 𝑟(𝑠))");
+    }
 }

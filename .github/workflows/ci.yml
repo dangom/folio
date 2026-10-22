@@ -26,6 +26,9 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Test
+        run: cargo test --release
+
       - name: Smoke test
         run: |
           folio=target/release/folio
@@ -36,6 +39,9 @@ jobs:
           # Hard-wrapped paragraph lines are reflowed as one.
           printf 'one\ntwo\n' > "$RUNNER_TEMP/p.md"
           $folio "$RUNNER_TEMP/p.md" | grep -q 'one two'
+          # TeX math is set in Unicode.
+          printf '$\\alpha^2$\n' > "$RUNNER_TEMP/m.md"
+          $folio "$RUNNER_TEMP/m.md" | grep -q 'α²'
           # Other files are declined, so less shows them as is.
           if $folio Cargo.toml; then exit 1; fi
           # Piped code passes through byte for byte.

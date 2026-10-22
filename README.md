@@ -41,6 +41,8 @@ Meant to look like ink on paper.
 - prose wrapped at 80 columns, lists and quotes hanging under their text
 - markup and metadata faded: drawers, keywords, dates, tags, comments, URLs
 - typographic bullets and check boxes, and booktabs tables
+- TeX math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`, `\begin{align}`, ```` ```math ````) set in
+  Unicode: math italic, symbols, raised and lowered scripts, display math centred
 
 Code and tables never wrapped though.
 
