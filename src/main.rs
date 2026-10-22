@@ -8,6 +8,7 @@
 //! the text and an H1, H2… marker hanging in the left margin, booktabs tables,
 //! and colour kept for warnings and errors.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Read, StdoutLock, Write};
 use std::path::Path;
@@ -855,14 +856,18 @@ fn item(ink: &mut Ink, t: &[u8], marker: usize, inline: Inline, org: bool) {
     inline(ink, body);
 }
 
-/// Carry the paragraph begun by `lines[*i - 1]` on with each line that
-/// continues it, on the same output line so the whole of it wraps as one.
-fn reflow(ink: &mut Ink, lines: &[&[u8]], i: &mut usize, inline: Inline, continues: fn(&[&[u8]], usize) -> bool) {
+/// The paragraph begun by `first`, from `lines[*i - 1]`, carried on with each
+/// line that continues it: one line of text, so the whole of it wraps as one
+/// and inline markup can span its source lines.
+fn reflow<'a>(first: &'a [u8], lines: &[&[u8]], i: &mut usize, continues: fn(&[&[u8]], usize) -> bool) -> Cow<'a, [u8]> {
+    let mut text = Cow::Borrowed(first);
     while *i < lines.len() && continues(lines, *i) {
-        ink.raw(" ");
-        inline(ink, lines[*i].trim_ascii());
+        let t = text.to_mut();
+        t.push(b' ');
+        t.extend_from_slice(lines[*i].trim_ascii());
         *i += 1;
     }
+    text
 }
 
 // ---------------------------------------------------------------- tables
@@ -1079,8 +1084,7 @@ fn markdown(src: &[u8], ink: &mut Ink) {
         } else if let Some(m) = list_marker(t, true) {
             in_list = true;
             ink.raw(lead);
-            item(ink, t.trim_ascii_end(), m, md_inline, false);
-            reflow(ink, &lines, &mut i, md_inline, |l, k| md_continues(l[k - 1], l[k], l.get(k + 1).copied()));
+            item(ink, &reflow(t.trim_ascii_end(), &lines, &mut i, |l, k| md_continues(l[k - 1], l[k], l.get(k + 1).copied())), m, md_inline, false);
         } else if t[0] == b'[' && find(t, b"]:").is_some_and(|p| p > 1) {
             ink.styled(ink.p.faded, line); // link reference or footnote definition
         } else if t.contains(&b'|')
@@ -1109,8 +1113,7 @@ fn markdown(src: &[u8], ink: &mut Ink) {
         } else {
             ink.raw(lead);
             ink.hang();
-            md_inline(ink, t.trim_ascii_end());
-            reflow(ink, &lines, &mut i, md_inline, |l, k| md_continues(l[k - 1], l[k], l.get(k + 1).copied()));
+            md_inline(ink, &reflow(t.trim_ascii_end(), &lines, &mut i, |l, k| md_continues(l[k - 1], l[k], l.get(k + 1).copied())));
         }
         ink.nl();
     }
@@ -1581,8 +1584,7 @@ fn org(src: &[u8], ink: &mut Ink) {
                         ink.raw(lead);
                         ink.hang();
                         ink.push(ink.p.quote);
-                        org_inline(ink, t.trim_ascii_end());
-                        reflow(ink, &lines, &mut i, org_inline, org_continues);
+                        org_inline(ink, &reflow(t.trim_ascii_end(), &lines, &mut i, org_continues));
                         ink.pop();
                     }
                     Block::Text => {
@@ -1678,13 +1680,11 @@ fn org(src: &[u8], ink: &mut Ink) {
             continue;
         } else if let Some(m) = list_marker(t, ind > 0) {
             ink.raw(lead);
-            item(ink, t.trim_ascii_end(), m, org_inline, true);
-            reflow(ink, &lines, &mut i, org_inline, org_continues);
+            item(ink, &reflow(t.trim_ascii_end(), &lines, &mut i, org_continues), m, org_inline, true);
         } else {
             ink.raw(lead);
             ink.hang();
-            org_inline(ink, t.trim_ascii_end());
-            reflow(ink, &lines, &mut i, org_inline, org_continues);
+            org_inline(ink, &reflow(t.trim_ascii_end(), &lines, &mut i, org_continues));
         }
         ink.nl();
     }
