@@ -33,6 +33,9 @@ jobs:
           $folio README.md | grep -q 'H1'
           printf '* Heading\n' > "$RUNNER_TEMP/t.org"
           $folio "$RUNNER_TEMP/t.org" | grep -q 'H1'
+          # Hard-wrapped paragraph lines are reflowed as one.
+          printf 'one\ntwo\n' > "$RUNNER_TEMP/p.md"
+          $folio "$RUNNER_TEMP/p.md" | grep -q 'one two'
           # Other files are declined, so less shows them as is.
           if $folio Cargo.toml; then exit 1; fi
           # Piped code passes through byte for byte.

@@ -855,6 +855,16 @@ fn item(ink: &mut Ink, t: &[u8], marker: usize, inline: Inline, org: bool) {
     inline(ink, body);
 }
 
+/// Carry the paragraph begun by `lines[*i - 1]` on with each line that
+/// continues it, on the same output line so the whole of it wraps as one.
+fn reflow(ink: &mut Ink, lines: &[&[u8]], i: &mut usize, inline: Inline, continues: fn(&[&[u8]], usize) -> bool) {
+    while *i < lines.len() && continues(lines, *i) {
+        ink.raw(" ");
+        inline(ink, lines[*i].trim_ascii());
+        *i += 1;
+    }
+}
+
 // ---------------------------------------------------------------- tables
 
 #[derive(Clone, Copy)]
@@ -1049,11 +1059,12 @@ fn markdown(src: &[u8], ink: &mut Ink) {
             in_comment = find(&t[4..], b"-->").is_none();
         } else if t[0] == b'>' {
             ink.raw(lead);
-            md_quote(ink, t);
+            md_quote(ink, &lines, &mut i);
         } else if let Some(m) = list_marker(t, true) {
             in_list = true;
             ink.raw(lead);
-            item(ink, t, m, md_inline, false);
+            item(ink, t.trim_ascii_end(), m, md_inline, false);
+            reflow(ink, &lines, &mut i, md_inline, |l, k| md_continues(l[k - 1], l[k], l.get(k + 1).copied()));
         } else if t[0] == b'[' && find(t, b"]:").is_some_and(|p| p > 1) {
             ink.styled(ink.p.faded, line); // link reference or footnote definition
         } else if t.contains(&b'|')
@@ -1082,10 +1093,28 @@ fn markdown(src: &[u8], ink: &mut Ink) {
         } else {
             ink.raw(lead);
             ink.hang();
-            md_inline(ink, t);
+            md_inline(ink, t.trim_ascii_end());
+            reflow(ink, &lines, &mut i, md_inline, |l, k| md_continues(l[k - 1], l[k], l.get(k + 1).copied()));
         }
         ink.nl();
     }
+}
+
+/// Whether `lines[k]` goes on with the paragraph above it, rather than
+/// after a hard line break or as the start of another block.
+fn md_continues(prev: &[u8], line: &[u8], next: Option<&[u8]>) -> bool {
+    let t = line.trim_ascii();
+    !(t.is_empty()
+        || prev.trim_ascii().is_empty()
+        || prev.ends_with(b"  ")
+        || prev.ends_with(b"\\")
+        || fence_open(t).is_some()
+        || atx(t).is_some()
+        || is_hr(t)
+        || t.starts_with(b"<!--")
+        || t[0] == b'>'
+        || list_marker(t, true).is_some()
+        || next.is_some_and(|l| setext(l).is_some() || table_delim(l).is_some()))
 }
 
 /// A code fence (3+ backticks or tildes): its char, length and info string.
@@ -1163,17 +1192,9 @@ fn table_delim(l: &[u8]) -> Option<Vec<Align>> {
         .collect()
 }
 
-fn md_quote(ink: &mut Ink, t: &[u8]) {
-    let mut depth = 0;
-    let mut s = t;
-    while let Some(r) = s.strip_prefix(b">") {
-        depth += 1;
-        s = r.strip_prefix(b" ").unwrap_or(r);
-        let (_, rest) = indent(s);
-        if rest.starts_with(b">") {
-            s = rest;
-        }
-    }
+/// The quote line `lines[*i - 1]`, and the lines after it that continue its paragraph.
+fn md_quote(ink: &mut Ink, lines: &[&[u8]], i: &mut usize) {
+    let (depth, s) = quoted(lines[*i - 1]);
     ink.push(ink.p.faded);
     for _ in 0..depth {
         ink.raw("│ ");
@@ -1201,9 +1222,34 @@ fn md_quote(ink: &mut Ink, t: &[u8]) {
         ink.raw(lead);
         ink.hang();
         ink.push(ink.p.quote);
-        md_inline(ink, body);
+        md_inline(ink, body.trim_ascii_end());
+        while *i < lines.len() {
+            let (d, next) = quoted(lines[*i]);
+            let after = lines.get(*i + 1).map(|l| quoted(l).1);
+            if d != depth || !md_continues(quoted(lines[*i - 1]).1, next, after) {
+                break;
+            }
+            ink.raw(" ");
+            md_inline(ink, next.trim_ascii());
+            *i += 1;
+        }
         ink.pop();
     }
+}
+
+/// The depth of a quote line's `>` markers, and the text after them.
+fn quoted(line: &[u8]) -> (usize, &[u8]) {
+    let mut depth = 0;
+    let mut s = indent(line).1;
+    while let Some(r) = s.strip_prefix(b">") {
+        depth += 1;
+        s = r.strip_prefix(b" ").unwrap_or(r);
+        let (_, rest) = indent(s);
+        if rest.starts_with(b">") {
+            s = rest;
+        }
+    }
+    (depth, s)
 }
 
 /// The word of a GitHub alert marker such as `> [!NOTE]`.
@@ -1517,7 +1563,8 @@ fn org(src: &[u8], ink: &mut Ink) {
                         ink.raw(lead);
                         ink.hang();
                         ink.push(ink.p.quote);
-                        org_inline(ink, t);
+                        org_inline(ink, t.trim_ascii_end());
+                        reflow(ink, &lines, &mut i, org_inline, org_continues);
                         ink.pop();
                     }
                     Block::Text => {
@@ -1607,14 +1654,32 @@ fn org(src: &[u8], ink: &mut Ink) {
             continue;
         } else if let Some(m) = list_marker(t, ind > 0) {
             ink.raw(lead);
-            item(ink, t, m, org_inline, true);
+            item(ink, t.trim_ascii_end(), m, org_inline, true);
+            reflow(ink, &lines, &mut i, org_inline, org_continues);
         } else {
             ink.raw(lead);
             ink.hang();
-            org_inline(ink, t);
+            org_inline(ink, t.trim_ascii_end());
+            reflow(ink, &lines, &mut i, org_inline, org_continues);
         }
         ink.nl();
     }
+}
+
+/// Whether `lines[k]` goes on with the paragraph above it, rather than
+/// after a `\\` line break or as the start of another element.
+fn org_continues(lines: &[&[u8]], k: usize) -> bool {
+    let l = lines[k];
+    let (ind, t) = indent(l);
+    !(t.is_empty()
+        || lines[k - 1].trim_ascii_end().ends_with(b"\\\\")
+        || (l[0] == b'*' && matches!(l.get(run(l, 0, b'*')), Some(b' ' | b'\t')))
+        || t[0] == b'#'
+        || t[0] == b':'
+        || t[0] == b'|'
+        || PLANNING.iter().any(|p| t.starts_with(p))
+        || (t.len() >= 5 && t.iter().all(|&b| b == b'-'))
+        || list_marker(t, ind > 0).is_some())
 }
 
 fn block_end(t: &[u8], name: &[u8]) -> bool {
